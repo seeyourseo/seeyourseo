@@ -1,0 +1,21 @@
+[package]
+name = "site-crawler"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone in-memory website crawler API"
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+futures = "0.3"
+html-escape = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
+scraper = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+

@@ -1,0 +1,3 @@
+[submodule "third_party/obscura"]
+	path = third_party/obscura
+	url = https://github.com/h4ckf0r0day/obscura.git

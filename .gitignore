@@ -1,0 +1,14 @@
+# Build outputs and compiled binaries
+/build/
+/backend/target/
+/services/*/target/
+
+# macOS metadata
+.DS_Store
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
