@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="theme-color" content="#f4f7f3">
+  <title>Private usage dashboard | SeeYourSEO</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    :root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17211d;background:#f4f7f3}*{box-sizing:border-box}body{margin:0}.wrap{max-width:1080px;margin:0 auto;padding:34px 22px 64px}.top{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:26px}.brand{display:flex;align-items:center;gap:10px;color:#173d31;text-decoration:none;font-size:19px;font-weight:800}.mark{display:grid;place-items:center;width:34px;height:34px;border-radius:10px;background:#173d31;color:#b9ed93}.top small,.muted{color:#526259}.card{padding:22px;border:1px solid #e1e9e2;border-radius:16px;background:#fff;box-shadow:0 8px 28px #15382e0a}.login{max-width:420px;margin:12vh auto}.login h1{margin:0 0 8px}.login p{color:#526259;line-height:1.6}.login form{display:flex;gap:8px;margin-top:20px}.login input{min-width:0;flex:1;padding:12px;border:1px solid #d7e2d9;border-radius:9px}.button{border:0;border-radius:9px;padding:11px 16px;background:#173d31;color:#fff;font-weight:700;cursor:pointer}.button.subtle{border:1px solid #d7e2d9;background:#fff;color:#52665b}.error{min-height:20px;color:#a53f2e;font-size:13px}.notice{margin-top:15px;color:#526259;font-size:12px;line-height:1.55}.header{display:flex;align-items:end;justify-content:space-between;gap:20px;margin-bottom:18px}.header h1{margin:0;font-size:28px;letter-spacing:-.03em}.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin:18px 0}.kpi{padding:17px;border:1px solid #e1e9e2;border-radius:14px;background:#fff}.kpi b{display:block;margin:7px 0;font-size:27px}.kpi span{color:#526259;font-size:12px}.grid{display:grid;grid-template-columns:1.15fr .85fr;gap:14px;margin-top:14px}.wide{grid-column:1/-1}.panel h2{margin:0 0 14px;font-size:17px}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:10px 8px;border-bottom:1px solid #edf0ed;text-align:left;vertical-align:top}th{color:#526259;font-size:11px;text-transform:uppercase;letter-spacing:.06em}.domain{overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,monospace}.bar-row{display:grid;grid-template-columns:95px 1fr 34px;align-items:center;gap:10px;margin:11px 0;font-size:12px}.bar-track{height:8px;overflow:hidden;border-radius:8px;background:#e9efe9}.bar-fill{height:100%;border-radius:8px;background:#70b47c}.footnote{margin-top:16px;color:#526259;font-size:12px;line-height:1.6}.hidden{display:none!important}@media(max-width:760px){.wrap{padding:22px 14px}.kpis{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.wide{grid-column:auto}.header{align-items:flex-start;flex-direction:column}.login form{flex-direction:column}}
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="top"><a class="brand" href="/"><span class="mark">S</span>SeeYourSEO <small>Private dashboard</small></a><button id="logout" class="button subtle hidden" type="button">Lock dashboard</button></header>
+    <section id="login" class="card login">
+      <h1>Private usage dashboard</h1>
+      <p>Enter the admin password to view scan activity and recent visitor IPs.</p>
+      <form id="login-form"><input id="password" type="password" autocomplete="current-password" placeholder="Admin password" required><button class="button" type="submit">Unlock</button></form>
+      <div id="login-error" class="error" role="status"></div>
+      <div class="notice">This dashboard is not indexed. The password stays in this browser tab and is sent only to SeeYourSEO over HTTPS.</div>
+    </section>
+    <section id="dashboard" class="hidden">
+      <div class="header"><div><h1>Usage overview</h1><div class="muted">Last 30 days · <span id="updated">—</span></div></div><button id="refresh" class="button subtle" type="button">Refresh</button></div>
+      <div id="kpis" class="kpis"></div>
+      <div class="grid">
+        <section class="card panel"><h2>Most scanned websites</h2><div class="table-wrap"><table><thead><tr><th>Website</th><th>Scans</th><th>Completed</th><th>Pages</th><th>Latest</th></tr></thead><tbody id="domains"></tbody></table></div><p id="empty-domains" class="muted hidden">No scans recorded yet.</p></section>
+        <section class="card panel"><h2>Scans by day</h2><div id="daily"></div></section>
+        <section class="card panel wide"><h2>Recent visitor IPs <span class="muted">· last 7 days</span></h2><div class="table-wrap"><table><thead><tr><th>IP address</th><th>Page visits</th><th>Latest visit</th><th>Last page</th><th>HTTP</th></tr></thead><tbody id="visitors"></tbody></table></div><p id="empty-visitors" class="muted hidden">No visitor IPs recorded yet.</p></section>
+      </div>
+      <p class="footnote">Scan activity is kept for up to 30 days. The visitor table groups page requests by IP and keeps the IP, page path, time, and response status for up to 7 days. An IP may be shared or change over time, so it does not identify one person. The log covers page requests that reach our server; Cloudflare may serve cached responses without contacting it.</p>
+    </section>
+  </main>
+  <script>
+    const $=s=>document.querySelector(s), key='seeyourseo-admin-token';
+    function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+    function tokenHeader(s){return Array.from(new TextEncoder().encode(s),b=>b.toString(16).padStart(2,'0')).join('')}
+    function dateTime(s){return new Date(Number(s)*1000).toLocaleString()}
+    function setView(open){$('#login').classList.toggle('hidden',open);$('#dashboard').classList.toggle('hidden',!open);$('#logout').classList.toggle('hidden',!open)}
+    async function load(token){const r=await fetch('/api/admin/metrics',{headers:{Authorization:`Bearer ${tokenHeader(token)}`},cache:'no-store'});if(r.status===401)throw Error('The password was not accepted.');if(!r.ok)throw Error('Could not load the dashboard.');const d=await r.json();render(d)}
+    function render(d){setView(true);$('#updated').textContent=new Date().toLocaleTimeString();$('#kpis').innerHTML=[['Scans',d.total_scans,'last 30 days'],['Websites',d.unique_domains,'last 30 days'],['Completed',d.completed,'last 30 days'],['Failed',d.failed,'last 30 days'],['Pages scanned',d.pages_scanned,'last 30 days'],['Page visits',d.visitor_page_views,'last 7 days'],['Visitor IPs',d.unique_visitor_ips,'last 7 days']].map(([label,value,period])=>`<div class="kpi"><span>${label}</span><b>${Number(value||0).toLocaleString()}</b><span>${period}</span></div>`).join('');const domains=d.domains||[];$('#domains').innerHTML=domains.map(x=>`<tr><td class="domain">${esc(x.domain)}</td><td>${Number(x.scans||0).toLocaleString()}</td><td>${Number(x.completed||0).toLocaleString()}</td><td>${Number(x.pages_scanned||0).toLocaleString()}</td><td>${esc(dateTime(x.latest_scan_at))}</td></tr>`).join('');$('#empty-domains').classList.toggle('hidden',domains.length>0);const daily=d.daily||[],max=Math.max(1,...daily.map(x=>Number(x.scans)||0));$('#daily').innerHTML=daily.map(x=>{const dt=new Date(Number(x.day)*86400000);return `<div class="bar-row"><span>${dt.toLocaleDateString(undefined,{month:'short',day:'numeric'})}</span><div class="bar-track"><div class="bar-fill" style="width:${(Number(x.scans||0)/max*100).toFixed(1)}%"></div></div><b>${Number(x.scans||0)}</b></div>`}).join('');const visitors=d.visitors||[];$('#visitors').innerHTML=visitors.map(x=>`<tr><td class="domain">${esc(x.ip)}</td><td>${Number(x.page_visits||0).toLocaleString()}</td><td>${esc(dateTime(x.latest_at))}</td><td class="domain">${esc(x.last_page)}</td><td>${Number(x.last_status||0)}</td></tr>`).join('');$('#empty-visitors').classList.toggle('hidden',visitors.length>0)}
+    $('#login-form').addEventListener('submit',async e=>{e.preventDefault();const token=$('#password').value;try{await load(token);sessionStorage.setItem(key,token);$('#password').value='';$('#login-error').textContent=''}catch(err){$('#login-error').textContent=err.message;sessionStorage.removeItem(key)}});
+    $('#refresh').onclick=()=>{const token=sessionStorage.getItem(key);if(token)load(token).catch(err=>{sessionStorage.removeItem(key);setView(false);$('#login-error').textContent=err.message})};
+    $('#logout').onclick=()=>{sessionStorage.removeItem(key);setView(false)};
+    const saved=sessionStorage.getItem(key);if(saved)load(saved).catch(()=>{sessionStorage.removeItem(key);setView(false)});
+  </script>
+</body>
+</html>

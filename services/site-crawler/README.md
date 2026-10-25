@@ -20,6 +20,13 @@ unauthenticated. Configure it with
 `CRAWLER_EXTERNAL_LINK_TIMEOUT_SECONDS` (default 5). `CRAWLER_USER_AGENT`
 overrides the browser-like default User-Agent.
 
+The crawl scheduler uses the Spider Rust crawler by default. It runs at most
+four same-site page requests concurrently, waits 150 ms between requests, and
+retries a transient page-fetch failure once. A project-owned fetch adapter
+still pins each public DNS result and validates every redirect hop before
+connecting. Robots rules do not restrict the crawl. Set `CRAWLER_ENGINE=legacy`
+to switch back to the previous scheduler while comparing results.
+
 ## API
 
 Create a crawl:

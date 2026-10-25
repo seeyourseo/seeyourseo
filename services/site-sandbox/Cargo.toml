@@ -1,0 +1,12 @@
+[package]
+name = "site-sandbox"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Linux process confinement for SeeYourSEO services"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.7"
+libc = "0.2"
+seccompiler = "0.5"
+

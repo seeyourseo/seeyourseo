@@ -7,10 +7,15 @@ license = "MIT"
 
 [dependencies]
 axum = "0.8"
+async-trait = "0.1"
+brotli = "8"
+flate2 = "1"
 futures = "0.3"
 html-escape = "0.2"
+psl = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
 scraper = "0.22"
+spider = { version = "2.53.9", default-features = false, features = ["sync", "sitemap", "time", "headers"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2"
@@ -18,4 +23,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+site-sandbox = { path = "../site-sandbox" }
+zstd = "0.13"
 

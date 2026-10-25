@@ -3,8 +3,15 @@ use std::{sync::Arc, time::Duration};
 use site_analyzer::{AppState, Config, router};
 use tokio::net::TcpListener;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    site_sandbox::apply(site_sandbox::Service::Analyzer)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let state = Arc::new(AppState::new(config.clone()));
     let cleanup_state = state.clone();

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive"><title>Your account | SeeYourSEO</title>
+  <meta name="description" content="Access scan credits from an earlier SeeYourSEO purchase. New scans are free with no fixed page cap."><meta name="keywords" content="SeeYourSEO account, previous scan credit, free SEO scan">
+  <link rel="canonical" href="https://seeyourseo.com/account"><link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <style>
+    :root{font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17211d;background:#f4f7f3}*{box-sizing:border-box}body{margin:0}.top{max-width:900px;margin:auto;padding:20px}.top a{color:#173d31;font-weight:800;text-decoration:none}.card{max-width:680px;margin:8vh auto;padding:28px;background:white;border:1px solid #dce6dd;border-radius:18px}.muted{color:#526259;line-height:1.65}.form label{display:block;margin:13px 0 6px;font-size:13px;font-weight:650}.form input{width:100%;padding:12px;border:1px solid #ccd9ce;border-radius:9px;font:inherit}.button{display:inline-block;margin-top:14px;border:0;border-radius:10px;background:#173d31;color:#fff;padding:13px 18px;font-weight:700;cursor:pointer;text-decoration:none}.status{min-height:24px;color:#426c50}.hidden{display:none}.account-actions{display:flex;flex-wrap:wrap;gap:12px;margin:14px 0 22px}.account-actions .button{margin-top:0}.receipt{padding:13px 0;border-top:1px solid #e5ece6;font-size:13px}.receipt div{margin:4px 0;color:#64736a;overflow-wrap:anywhere}.foot{max-width:900px;margin:auto;text-align:center;color:#526259;font-size:13px;padding:20px}.foot a{color:#426c50}
+  </style>
+</head><body>
+<header class="top"><a href="/">SeeYourSEO</a></header>
+<main class="card">
+  <h1 id="heading">Sign in to SeeYourSEO</h1>
+  <p id="summary" class="muted">For scan credits purchased earlier, enter the purchase email to check its remaining balance. New scans are free with no fixed page cap. No email is sent.</p>
+  <form id="login-form" class="form"><label for="email">Previous purchase email</label><input id="email" type="email" required autocomplete="email" placeholder="you@example.com"><button class="button" id="login-button">Check existing scan credit</button></form>
+  <p class="muted" style="font-size:12px">Email-only access does not verify inbox ownership. Use an address you control; anyone who knows it could access its unused scan credit.</p>
+  <p id="status" class="status" role="status"></p>
+  <a class="button hidden" id="repurchase" href="/scan">Start a free scan</a>
+  <section id="account" class="hidden"><p id="account-info"></p><div class="account-actions"><a class="button" href="/scan">Start a scan</a><button class="button" id="logout">Sign out</button></div><h2>Payment records</h2><div id="receipts"></div></section>
+</main>
+<footer class="foot"><a href="/scan">Free scan</a> · <a href="/privacy">Privacy</a> · <a href="mailto:hello@seeyourseo.com">Contact</a></footer>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function showAccount(account){$('#login-form').classList.add('hidden');$('#repurchase').classList.add('hidden');$('#account').classList.remove('hidden');$('#heading').textContent='You’re signed in';$('#summary').textContent=account.email;$('#account-info').textContent=`${account.scan_credits} unused scan credit${account.scan_credits===1?'':'s'} from earlier purchase${account.scan_credits===1?'':'s'} · up to ${account.page_limit.toLocaleString()} pages per scan.`;const target=$('#receipts');if(!account.receipts.length){target.textContent='No previous payments recorded.'}else{target.innerHTML=account.receipts.map(r=>`<article class="receipt"><strong>${esc(r.plan_id)} · ${esc(r.amount)} ${esc(r.currency)} · Payment ${esc(r.status)}</strong><div>Scan credit: ${esc(r.usage_status)} · paid ${esc(r.captured_at)} · confirmed by ${esc(r.confirmed_by)}</div><div>PayPal order ${esc(r.paypal_order_id)}</div><div>Capture reference ${esc(r.paypal_capture_id)}</div></article>`).join('')}}
+async function load(){if(new URLSearchParams(location.search).get('payment')==='success')$('#status').textContent='Earlier payment confirmed. Your scan credit is ready. Enter the website when you start your scan.';try{const response=await fetch('/api/auth/me');if(response.ok)showAccount(await response.json())}catch{}}
+load();
+$('#login-form').addEventListener('submit',async event=>{event.preventDefault();const button=$('#login-button'),email=$('#email').value.trim();button.disabled=true;$('#status').textContent='Checking previous scan credit…';$('#repurchase').classList.add('hidden');try{const response=await fetch('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email})}),data=await response.json();if(!response.ok)throw new Error(data.error||'Could not check this email');if(data.status==='signed_in'){showAccount(data.account);$('#status').textContent='Your previous scan credit is available. You’re signed in.'}else{$('#repurchase').classList.remove('hidden');$('#status').textContent=data.reason==='credit_used'?'Your earlier scan credit has been used. Start a free scan of up to 20 pages.':'No previous scan credit was found for this email. Start a free scan of up to 20 pages.'}}catch(error){$('#status').textContent=error.message}finally{button.disabled=false}});
+$('#logout').onclick=async()=>{await fetch('/api/auth/logout',{method:'POST'});location.reload()};
+</script></body></html>

@@ -12,7 +12,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     exit 2
   fi
   for label in local.sitesissues.crawler local.sitesissues.analyzer local.sitesissues.renderer local.sitesissues.site-audit-server; do
-    if rtk proxy launchctl print "system/$label" >/dev/null 2>&1; then
+    if launchctl print "system/$label" >/dev/null 2>&1; then
       echo "System LaunchDaemon $label is still installed. Run 'sudo ./uninstall-service.sh' once, then retry as your normal user." >&2
       exit 3
     fi
@@ -20,6 +20,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   if [[ " ${*:-} " != *" --user "* ]]; then
     set -- --user "$@"
   fi
+elif [[ "$(uname -s)" == "Linux" && " ${*:-} " != *" --user "* ]]; then
+  set -- --user "$@"
 fi
 
 NEED_BUILD=false
@@ -30,14 +32,14 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   for binary in site-crawler site-analyzer site-renderer site-audit-server obscura obscura-worker; do
     [[ -f "$ROOT/build/bin/$binary" ]] || continue
     if [[ ! -x "$ROOT/build/bin/$binary" ]] ||
-      ! rtk codesign --verify --strict "$ROOT/build/bin/$binary" >/dev/null 2>&1; then
+      ! codesign --verify --strict "$ROOT/build/bin/$binary" >/dev/null 2>&1; then
       NEED_BUILD=true
     fi
   done
 fi
 
 if [[ "$NEED_BUILD" == true ]]; then
-  rtk proxy bash "$ROOT/build.sh"
+  bash "$ROOT/build.sh"
 fi
 
-rtk proxy "$BACKEND" install-services "$@"
+"$BACKEND" install-services "$@"

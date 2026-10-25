@@ -164,7 +164,11 @@ pub enum AnalysisStatus {
 pub struct PageInput {
     pub url: String,
     #[serde(default)]
+    pub final_url: Option<String>,
+    #[serde(default)]
     pub status_code: Option<u16>,
+    #[serde(default)]
+    pub initial_status_code: Option<u16>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -175,6 +179,12 @@ pub struct PageInput {
     pub robots: Option<String>,
     #[serde(default)]
     pub content_type: Option<String>,
+    #[serde(default)]
+    pub content_encoding: Option<String>,
+    #[serde(default)]
+    pub cache_control: Option<String>,
+    #[serde(default)]
+    pub body_fingerprint: Option<String>,
     #[serde(default)]
     pub redirect_chain: Vec<String>,
     #[serde(default)]
@@ -193,6 +203,10 @@ pub struct PageInput {
     pub ttfb_ms: Option<u128>,
     #[serde(default)]
     pub response_size_bytes: Option<usize>,
+    #[serde(default)]
+    pub raw_response_size_bytes: Option<usize>,
+    #[serde(default)]
+    pub partial_content: bool,
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -249,6 +263,7 @@ pub struct PageIssue {
     pub severity: Severity,
     pub url: String,
     pub target_url: Option<String>,
+    pub source_urls: Vec<String>,
     pub anchor_text: Option<String>,
     pub link_position: Option<usize>,
     pub message: String,
@@ -298,13 +313,21 @@ pub struct PageAudit {
     pub depth: usize,
     pub inbound_link_count: usize,
     pub status_code: Option<u16>,
+    pub final_status_code: Option<u16>,
+    pub final_url: Option<String>,
     pub load_duration_ms: Option<u128>,
     pub ttfb_ms: Option<u128>,
     pub response_size_bytes: Option<usize>,
+    pub raw_response_size_bytes: Option<usize>,
+    pub content_encoding: Option<String>,
+    pub cache_control: Option<String>,
+    pub redirect_chain: Vec<String>,
     pub h1_count: usize,
+    pub partial_content: bool,
     pub is_dead_page: bool,
     pub error: Option<String>,
     pub title: Option<String>,
+    pub description: Option<String>,
     pub content: content::ContentPageMetrics,
     pub internal_link_count: usize,
     pub external_link_count: usize,
@@ -623,15 +646,50 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
     for (index, page) in pages.iter().enumerate() {
         let page_url = normalize_url(&page.url).unwrap_or_else(|| page.url.clone());
         url_to_page.insert(page_url.clone(), index);
-        if page.error.is_some() || page.status_code.is_some_and(|status| status >= 400) {
+        if let Some(final_url) = page.final_url.as_deref().and_then(normalize_url) {
+            url_to_page.entry(final_url).or_insert(index);
+        }
+        if page_unavailable(page) {
             failed_pages += 1;
             failed_urls.insert(page_url);
         }
     }
 
+    let mut fingerprints = HashMap::<&str, usize>::new();
     for page in pages {
+        if let Some(fingerprint) = page.body_fingerprint.as_deref() {
+            *fingerprints.entry(fingerprint).or_default() += 1;
+        }
+    }
+    let suspected_challenge = pages
+        .iter()
+        .map(|page| {
+            !is_redirect_page(page)
+                && page
+                    .body_fingerprint
+                    .as_deref()
+                    .is_some_and(|fp| fingerprints.get(fp).copied().unwrap_or_default() >= 3)
+                && page.response_size_bytes.is_some_and(|size| size <= 20_000)
+                && page
+                    .content_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
+                    < 100
+                && (is_blank(&page.title) || page.h1_count == 0)
+                && page.error.is_none()
+                && page
+                    .status_code
+                    .is_none_or(|status| (200..400).contains(&status))
+        })
+        .collect::<Vec<_>>();
+
+    let mut external_issue_targets = HashMap::<String, usize>::new();
+    let mut redirected_internal_pairs = HashSet::<(String, String)>::new();
+    for (page_index, page) in pages.iter().enumerate() {
         let page_url = normalize_url(&page.url).unwrap_or_else(|| page.url.clone());
-        if page.error.is_some() {
+        if page_unavailable(page) && (page.error.is_some() || page.status_code == Some(0)) {
             push_issue(
                 &mut issues,
                 "fetch_error",
@@ -639,6 +697,16 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                 &page_url,
                 None,
                 "The crawler could not fetch this page.",
+            );
+        }
+        if page_has_partial_response(page) {
+            push_issue(
+                &mut issues,
+                "partial_page_content",
+                Severity::Warning,
+                &page_url,
+                None,
+                "The page returned a successful response, but its body could not be read completely; content checks may be incomplete.",
             );
         }
         if let Some(status) = page.status_code.filter(|status| *status >= 400) {
@@ -668,7 +736,35 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
             };
             push_issue(&mut issues, code, severity, &page_url, None, &message);
         }
-        if is_blank(&page.title) {
+        if suspected_challenge[page_index] {
+            push_issue(
+                &mut issues,
+                "suspected_access_challenge",
+                Severity::Warning,
+                &page_url,
+                None,
+                "Several pages returned the same small response with little readable text; this may be an access challenge or a page that requires JavaScript rendering.",
+            );
+        }
+        let is_failed = page_unavailable(page) || page.error.is_some();
+        let is_redirect = is_redirect_page(page);
+        let is_html_page = page
+            .content_type
+            .as_deref()
+            .is_none_or(is_html_content_type);
+        let check_page_elements =
+            is_html_page && !is_failed && !is_redirect && !suspected_challenge[page_index];
+        if is_redirect {
+            push_issue(
+                &mut issues,
+                "page_redirect",
+                Severity::Info,
+                &page_url,
+                page.final_url.as_deref(),
+                "This URL redirects to another page; page metadata and content are reported for the destination.",
+            );
+        }
+        if check_page_elements && is_blank(&page.title) {
             push_issue(
                 &mut issues,
                 "missing_title",
@@ -678,10 +774,11 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                 "The page has no title.",
             );
         }
-        if let Some(title) = page
-            .title
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
+        if check_page_elements
+            && let Some(title) = page
+                .title
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
         {
             let length = title.chars().count();
             if !(15..=60).contains(&length) {
@@ -699,7 +796,7 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                 );
             }
         }
-        if is_blank(&page.description) {
+        if check_page_elements && is_blank(&page.description) {
             push_issue(
                 &mut issues,
                 "missing_description",
@@ -709,10 +806,11 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                 "The page has no meta description.",
             );
         }
-        if let Some(description) = page
-            .description
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
+        if check_page_elements
+            && let Some(description) = page
+                .description
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
         {
             let length = description.chars().count();
             if !(50..=160).contains(&length) {
@@ -732,11 +830,7 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                 );
             }
         }
-        let is_html_page = page
-            .content_type
-            .as_deref()
-            .is_none_or(|content_type| content_type.to_ascii_lowercase().contains("text/html"));
-        if is_html_page
+        if check_page_elements
             && page
                 .status_code
                 .is_none_or(|status| (200..400).contains(&status))
@@ -761,7 +855,7 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                 _ => {}
             }
         }
-        if is_blank(&page.canonical) {
+        if check_page_elements && is_blank(&page.canonical) {
             push_issue(
                 &mut issues,
                 "missing_canonical",
@@ -771,7 +865,7 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                 "The page has no canonical URL.",
             );
         }
-        if page.robots.as_deref().is_some_and(has_noindex) {
+        if check_page_elements && page.robots.as_deref().is_some_and(has_noindex) {
             push_issue(
                 &mut issues,
                 "noindex",
@@ -781,7 +875,8 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                 "The page has a noindex directive.",
             );
         }
-        if let Some(canonical) = page.canonical.as_deref()
+        if check_page_elements
+            && let Some(canonical) = page.canonical.as_deref()
             && let Some(canonical_key) = normalize_url(canonical)
             && canonical_key != page_url
             && let Some(target_page) = url_to_page.get(&canonical_key).map(|index| &pages[*index])
@@ -811,13 +906,41 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
             }
         }
         for link in &page.links {
-            if link.is_internal {
+            let internal = is_same_site(&page.url, &link.url);
+            if internal {
                 internal_links += 1;
                 if let Some(target) = normalize_url(&link.url) {
                     *incoming.entry(target.clone()).or_default() += 1;
                     if let Some(target_page) = url_to_page.get(&target).map(|index| &pages[*index])
-                        && (target_page.error.is_some()
-                            || target_page.status_code.is_some_and(|status| status >= 400))
+                        && is_redirect_page(target_page)
+                    {
+                        if let Some(destination) = target_page
+                            .final_url
+                            .as_deref()
+                            .and_then(normalize_url)
+                            .filter(|destination| destination != &target)
+                        {
+                            *incoming.entry(destination).or_default() += 1;
+                        }
+                    }
+                    if let Some(target_page) = url_to_page.get(&target).map(|index| &pages[*index])
+                        && is_redirect_page(target_page)
+                        && redirected_internal_pairs.insert((page_url.clone(), target.clone()))
+                    {
+                        push_issue(
+                            &mut issues,
+                            "internal_link_redirect",
+                            Severity::Info,
+                            &page_url,
+                            Some(&target),
+                            &format!(
+                                "This internal link points to a URL that redirects to {}; link directly to the destination when practical.",
+                                target_page.final_url.as_deref().unwrap_or(&target)
+                            ),
+                        );
+                    }
+                    if let Some(target_page) = url_to_page.get(&target).map(|index| &pages[*index])
+                        && page_unavailable(target_page)
                     {
                         let status = target_page.status_code.unwrap_or_default();
                         let (code, severity, message) = match status {
@@ -859,11 +982,13 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                             issue.anchor_text =
                                 (!link.text.trim().is_empty()).then(|| link.text.trim().to_owned());
                             issue.link_position = Some(link.position);
+                            issue.source_urls = vec![page_url.clone()];
                         }
                     }
                 }
             } else {
                 external_links += 1;
+                let target_key = normalize_url(&link.url).unwrap_or_else(|| link.url.clone());
                 if link.accessible == Some(false) {
                     let (code, severity, message) = match link.status_code {
                         Some(status @ (404 | 410)) => (
@@ -873,7 +998,7 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                                 "The destination returned HTTP {status} to the crawler; confirm in a browser because automated checks can receive a different response."
                             ),
                         ),
-                        Some(status @ (401 | 403 | 429)) => (
+                        Some(status @ (400 | 401 | 403 | 429)) => (
                             "external_link_access_restricted",
                             Severity::Warning,
                             format!(
@@ -891,26 +1016,32 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                             format!("The destination returned HTTP {status} during the scan."),
                         ),
                         None => (
-                            "external_link_check_failed",
+                            "external_link_access_restricted",
                             Severity::Warning,
                             format!(
-                                "The crawler could not verify this destination: {}.",
+                                "The automated request could not verify this destination; it may block automated checks. Check details: {}.",
                                 link.error.as_deref().unwrap_or("request failed")
                             ),
                         ),
                     };
-                    push_issue(
-                        &mut issues,
-                        code,
-                        severity,
-                        &page_url,
-                        Some(&link.url),
-                        &message,
-                    );
-                    if let Some(issue) = issues.last_mut() {
-                        issue.anchor_text =
+                    if let Some(existing) = external_issue_targets.get(&target_key).copied() {
+                        if !issues[existing].source_urls.contains(&page_url) {
+                            issues[existing].source_urls.push(page_url.clone());
+                        }
+                    } else {
+                        push_issue(
+                            &mut issues,
+                            code,
+                            severity,
+                            &page_url,
+                            Some(&link.url),
+                            &message,
+                        );
+                        let issue_index = issues.len() - 1;
+                        external_issue_targets.insert(target_key, issue_index);
+                        issues[issue_index].anchor_text =
                             (!link.text.trim().is_empty()).then(|| link.text.trim().to_owned());
-                        issue.link_position = Some(link.position);
+                        issues[issue_index].link_position = Some(link.position);
                     }
                 }
             }
@@ -942,7 +1073,15 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
     let mut orphan_pages = 0;
     for page in pages {
         let key = normalize_url(&page.url).unwrap_or_else(|| page.url.clone());
-        if page.depth > 0 && incoming.get(&key).copied().unwrap_or_default() == 0 {
+        if page.depth > 0
+            && page.error.is_none()
+            && !is_redirect_page(page)
+            && page
+                .content_type
+                .as_deref()
+                .is_some_and(is_html_content_type)
+            && incoming.get(&key).copied().unwrap_or_default() == 0
+        {
             orphan_pages += 1;
             push_issue(
                 &mut issues,
@@ -956,6 +1095,18 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
     }
 
     let (content_analysis, content_metrics) = content::analyze(pages, &incoming);
+    add_content_group_issues(
+        &content_analysis.exact_duplicate_groups,
+        &mut issues,
+        "duplicate_content",
+        "The downloaded HTML is identical across these pages.",
+    );
+    add_content_group_issues(
+        &content_analysis.similar_content_groups,
+        &mut issues,
+        "similar_content",
+        "These pages share a large amount of body text.",
+    );
     let page_audits = pages
         .iter()
         .zip(content_metrics)
@@ -964,7 +1115,7 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
             let broken_internal_links = page
                 .links
                 .iter()
-                .filter(|link| link.is_internal)
+                .filter(|link| is_same_site(&page.url, &link.url))
                 .filter_map(|link| normalize_url(&link.url))
                 .filter(|target| failed_urls.contains(target))
                 .collect::<HashSet<_>>()
@@ -973,29 +1124,43 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
             let mut broken_internal_links = broken_internal_links;
             broken_internal_links.sort();
             let inbound_link_count = incoming.get(&url).copied().unwrap_or_default();
+            let mut external_targets_seen = HashSet::new();
             PageAudit {
                 url,
                 depth: page.depth,
                 inbound_link_count,
-                status_code: page.status_code,
+                status_code: page.initial_status_code.or(page.status_code),
+                final_status_code: page.status_code,
+                final_url: page.final_url.clone(),
                 load_duration_ms: page.duration_ms,
                 ttfb_ms: page.ttfb_ms,
                 response_size_bytes: page.response_size_bytes,
+                raw_response_size_bytes: page.raw_response_size_bytes,
+                content_encoding: page.content_encoding.clone(),
+                cache_control: page.cache_control.clone(),
+                redirect_chain: page.redirect_chain.clone(),
                 h1_count: page.h1_count,
-                is_dead_page: page.error.is_some()
-                    || page
-                        .status_code
-                        .is_some_and(|status| matches!(status, 404 | 410)),
+                partial_content: page.partial_content || page_has_partial_response(page),
+                is_dead_page: page_unavailable(page),
                 error: page.error.clone(),
                 title: page.title.clone(),
+                description: page.description.clone(),
                 content,
-                internal_link_count: page.links.iter().filter(|link| link.is_internal).count(),
-                external_link_count: page.links.iter().filter(|link| !link.is_internal).count(),
+                internal_link_count: page
+                    .links
+                    .iter()
+                    .filter(|link| is_same_site(&page.url, &link.url))
+                    .count(),
+                external_link_count: page
+                    .links
+                    .iter()
+                    .filter(|link| !is_same_site(&page.url, &link.url))
+                    .count(),
                 broken_internal_links,
                 internal_links: page
                     .links
                     .iter()
-                    .filter(|link| link.is_internal)
+                    .filter(|link| is_same_site(&page.url, &link.url))
                     .filter_map(|link| {
                         normalize_url(&link.url).map(|url| InternalLinkAudit {
                             url,
@@ -1006,7 +1171,11 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
                 external_links: page
                     .links
                     .iter()
-                    .filter(|link| !link.is_internal)
+                    .filter(|link| !is_same_site(&page.url, &link.url))
+                    .filter(|link| {
+                        let key = normalize_url(&link.url).unwrap_or_else(|| link.url.clone());
+                        external_targets_seen.insert(key)
+                    })
                     .map(|link| ExternalLinkAudit {
                         url: link.url.clone(),
                         text: link.text.clone(),
@@ -1020,6 +1189,10 @@ fn analyze_pages(pages: &[PageInput]) -> AnalysisResult {
         })
         .collect();
 
+    for issue in &mut issues {
+        issue.source_urls.sort();
+        issue.source_urls.dedup();
+    }
     issues.sort_by(|a, b| (&a.url, &a.code, &a.target_url).cmp(&(&b.url, &b.code, &b.target_url)));
     let mut issue_counts = BTreeMap::new();
     for issue in &issues {
@@ -1049,6 +1222,15 @@ fn add_duplicate_issues(
 ) {
     let mut groups = HashMap::<String, Vec<String>>::new();
     for page in pages {
+        if page.error.is_some()
+            || is_redirect_page(page)
+            || page
+                .content_type
+                .as_deref()
+                .is_some_and(|value| !is_html_content_type(value))
+        {
+            continue;
+        }
         let Some(value) = value(page).map(str::trim).filter(|value| !value.is_empty()) else {
             continue;
         };
@@ -1070,6 +1252,27 @@ fn add_duplicate_issues(
     }
 }
 
+fn add_content_group_issues(
+    groups: &[content::ContentGroup],
+    issues: &mut Vec<PageIssue>,
+    code: &'static str,
+    message: &'static str,
+) {
+    for group in groups {
+        push_issue(
+            issues,
+            code,
+            Severity::Warning,
+            &group.recommended_page,
+            None,
+            message,
+        );
+        if let Some(issue) = issues.last_mut() {
+            issue.source_urls = group.pages.iter().map(|page| page.url.clone()).collect();
+        }
+    }
+}
+
 fn push_issue(
     issues: &mut Vec<PageIssue>,
     code: &'static str,
@@ -1083,6 +1286,7 @@ fn push_issue(
         severity,
         url: url.into(),
         target_url: target_url.map(str::to_owned),
+        source_urls: vec![url.to_owned()],
         anchor_text: None,
         link_position: None,
         message: message.into(),
@@ -1091,6 +1295,30 @@ fn push_issue(
 
 fn is_blank(value: &Option<String>) -> bool {
     value.as_deref().is_none_or(|value| value.trim().is_empty())
+}
+
+fn is_html_content_type(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("text/html") || value.contains("application/xhtml+xml")
+}
+
+fn is_redirect_page(page: &PageInput) -> bool {
+    !page.redirect_chain.is_empty()
+        || page
+            .status_code
+            .is_some_and(|status| matches!(status, 301 | 302 | 303 | 307 | 308))
+}
+
+fn page_unavailable(page: &PageInput) -> bool {
+    page.status_code
+        .is_none_or(|status| status == 0 || status >= 400)
+}
+
+fn page_has_partial_response(page: &PageInput) -> bool {
+    page.error.is_some()
+        && page
+            .status_code
+            .is_some_and(|status| (200..300).contains(&status))
 }
 
 fn has_noindex(value: &str) -> bool {
@@ -1106,4 +1334,16 @@ fn normalize_url(value: &str) -> Option<String> {
     }
     url.set_fragment(None);
     Some(url.to_string())
+}
+
+fn is_same_site(source: &str, target: &str) -> bool {
+    fn registrable(value: &str) -> Option<String> {
+        let host = Url::parse(value).ok()?.host_str()?.to_ascii_lowercase();
+        Some(
+            psl::domain_str(host.strip_prefix("www.").unwrap_or(&host))
+                .unwrap_or(host.as_str())
+                .to_owned(),
+        )
+    }
+    registrable(source).is_some() && registrable(source) == registrable(target)
 }

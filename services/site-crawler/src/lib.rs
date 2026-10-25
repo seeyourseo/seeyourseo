@@ -23,6 +23,8 @@ use tokio::{net::lookup_host, sync::RwLock};
 use url::Url;
 use uuid::Uuid;
 
+mod spider_crawl;
+
 #[derive(Clone)]
 pub struct Config {
     pub listen: SocketAddr,
@@ -154,7 +156,9 @@ struct LinkCheck {
 #[derive(Debug, Clone, Serialize)]
 pub struct PageRecord {
     pub url: String,
+    pub final_url: String,
     pub status_code: Option<u16>,
+    pub initial_status_code: Option<u16>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub canonical: Option<String>,
@@ -163,9 +167,14 @@ pub struct PageRecord {
     pub content_text: String,
     pub headings: Vec<ContentHeading>,
     pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub cache_control: Option<String>,
+    pub body_fingerprint: Option<String>,
     pub redirect_chain: Vec<String>,
     pub ttfb_ms: Option<u128>,
     pub response_size_bytes: Option<usize>,
+    pub raw_response_size_bytes: Option<usize>,
+    pub partial_content: bool,
     pub links: Vec<LinkRecord>,
     pub depth: usize,
     pub duration_ms: u128,
@@ -190,6 +199,19 @@ pub struct CrawlTaskView {
     pub crawl_id: Uuid,
     pub status: CrawlStatus,
     pub progress: CrawlProgress,
+    pub special_files: Vec<SpecialFileRecord>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpecialFileRecord {
+    pub name: String,
+    pub url: String,
+    pub final_url: Option<String>,
+    pub status_code: Option<u16>,
+    pub content_type: Option<String>,
+    pub duration_ms: u128,
+    pub redirect_chain: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -198,6 +220,7 @@ struct CrawlTask {
     status: CrawlStatus,
     progress: CrawlProgress,
     results: Vec<PageRecord>,
+    special_files: Vec<SpecialFileRecord>,
     error: Option<String>,
     updated_at: Instant,
 }
@@ -208,6 +231,7 @@ impl CrawlTask {
             crawl_id: self.id,
             status: self.status.clone(),
             progress: self.progress.clone(),
+            special_files: self.special_files.clone(),
             error: self.error.clone(),
         }
     }
@@ -323,6 +347,7 @@ pub async fn create_crawl(
             failed: 0,
         },
         results: Vec::new(),
+        special_files: Vec::new(),
         error: None,
         updated_at: Instant::now(),
     }));
@@ -424,6 +449,20 @@ async fn run_crawl(
     max_depth: Option<usize>,
     config: Config,
 ) {
+    if std::env::var("CRAWLER_ENGINE").is_ok_and(|engine| engine.eq_ignore_ascii_case("legacy")) {
+        run_crawl_legacy(task, start, max_pages, max_depth, config).await;
+    } else {
+        spider_crawl::run_crawl(task, start, max_pages, max_depth, config).await;
+    }
+}
+
+async fn run_crawl_legacy(
+    task: Arc<RwLock<CrawlTask>>,
+    start: Url,
+    max_pages: Option<usize>,
+    max_depth: Option<usize>,
+    config: Config,
+) {
     {
         let mut task = task.write().await;
         if matches!(task.status, CrawlStatus::Cancelled) {
@@ -436,10 +475,18 @@ async fn run_crawl(
         .unwrap_or(config.max_pages)
         .clamp(1, config.max_pages);
     let depth_limit = max_depth.unwrap_or(config.max_depth).min(config.max_depth);
+    let (sitemap_result, robots_result, llms_result) = tokio::join!(
+        discover_sitemap_pages(&start, &config, page_limit.saturating_sub(1)),
+        probe_special_file(&start, "/robots.txt", &config),
+        probe_special_file(&start, "/llms.txt", &config),
+    );
+    let (sitemap_pages, mut special_files) = sitemap_result;
+    special_files.extend([robots_result, llms_result]);
+    task.write().await.special_files = special_files;
     let mut seen = HashSet::from([crawl_key(&start)]);
     let mut queue = VecDeque::from([(start.clone(), 0usize)]);
     if depth_limit > 0 {
-        for url in discover_sitemap_pages(&start, &config, page_limit.saturating_sub(1)).await {
+        for url in sitemap_pages {
             if seen.len() >= page_limit {
                 break;
             }
@@ -512,21 +559,7 @@ async fn run_crawl(
     let link_checks = stream::iter(external_urls.into_iter().map(|(key, url)| {
         let timeout = config.external_link_timeout;
         let user_agent = config.user_agent.clone();
-        let renderer_url = config.renderer_url.clone();
-        let renderer_api_key = config.renderer_api_key.clone();
-        async move {
-            (
-                key,
-                check_external_link(
-                    &url,
-                    timeout,
-                    &user_agent,
-                    &renderer_url,
-                    renderer_api_key.as_deref(),
-                )
-                .await,
-            )
-        }
+        async move { (key, check_external_link(&url, timeout, &user_agent).await) }
     }))
     .buffer_unordered(config.concurrency.min(64))
     .collect::<HashMap<_, _>>()
@@ -557,39 +590,52 @@ async fn run_crawl(
     task.updated_at = Instant::now();
 }
 
-async fn discover_sitemap_pages(start: &Url, config: &Config, limit: usize) -> Vec<Url> {
-    if limit == 0 {
-        return Vec::new();
-    }
+async fn discover_sitemap_pages(
+    start: &Url,
+    config: &Config,
+    limit: usize,
+) -> (Vec<Url>, Vec<SpecialFileRecord>) {
     let Ok(sitemap) = start.join("/sitemap.xml") else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let Ok(index_sitemap) = start.join("/sitemap_index.xml") else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut sitemaps = VecDeque::from([sitemap, index_sitemap]);
     let mut seen_sitemaps = HashSet::new();
     let mut pages = Vec::new();
+    let mut special_files = Vec::new();
     let start_host = crawl_host(start);
     while let Some(sitemap) = sitemaps.pop_front() {
         if seen_sitemaps.len() >= 20
-            || pages.len() >= limit
+            || (limit > 0 && pages.len() >= limit)
             || !seen_sitemaps.insert(crawl_key(&sitemap))
             || crawl_host(&sitemap) != start_host
         {
             continue;
         }
+        let original = sitemap.clone();
+        let started = Instant::now();
         let mut current = sitemap;
+        let mut status_code = None;
+        let mut content_type = None;
+        let mut redirect_chain = Vec::new();
+        let mut error = None;
         let response = 'redirects: {
             for _ in 0..6 {
                 let addresses = match resolve_public_host(&current).await {
                     Ok(addresses) => addresses,
-                    Err(_) => break 'redirects None,
+                    Err(message) => {
+                        error = Some(message);
+                        break 'redirects None;
+                    }
                 };
                 let Some(host) = current.host_str() else {
+                    error = Some("sitemap URL has no host".into());
                     break 'redirects None;
                 };
                 let client = match Client::builder()
+                    .http1_only()
                     .redirect(Policy::none())
                     .timeout(config.request_timeout.min(Duration::from_secs(5)))
                     .user_agent(&config.user_agent)
@@ -598,39 +644,86 @@ async fn discover_sitemap_pages(start: &Url, config: &Config, limit: usize) -> V
                     .build()
                 {
                     Ok(client) => client,
-                    Err(_) => break 'redirects None,
+                    Err(problem) => {
+                        error = Some(problem.to_string());
+                        break 'redirects None;
+                    }
                 };
                 match client.get(current.clone()).send().await {
                     Ok(response) if response.status().is_redirection() => {
+                        let code = response.status().as_u16();
                         let Some(location) = response
                             .headers()
                             .get(reqwest::header::LOCATION)
                             .and_then(|value| value.to_str().ok())
                         else {
+                            status_code = Some(code);
+                            error = Some("redirect response has no valid Location header".into());
                             break 'redirects None;
                         };
                         let Ok(next) = current.join(location) else {
+                            status_code = Some(code);
+                            error = Some("redirect target is invalid".into());
                             break 'redirects None;
                         };
                         if crawl_host(&next) != start_host
                             || !matches!(next.scheme(), "http" | "https")
                         {
+                            status_code = Some(code);
+                            error = Some("redirect leaves the scanned site".into());
                             break 'redirects None;
                         }
+                        redirect_chain.push(format!("{current} [{code}] → {next}"));
+                        status_code = Some(code);
                         current = next;
                     }
-                    Ok(response) if response.status().is_success() => {
-                        break 'redirects Some(response);
+                    Ok(response) => {
+                        let code = response.status().as_u16();
+                        status_code = Some(code);
+                        content_type = response
+                            .headers()
+                            .get(reqwest::header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        if response.status().is_success() {
+                            break 'redirects Some(response);
+                        }
+                        error = Some(format!("HTTP {code}"));
+                        break 'redirects None;
                     }
-                    _ => break 'redirects None,
+                    Err(problem) => {
+                        error = Some(problem.to_string());
+                        break 'redirects None;
+                    }
                 }
             }
             None
         };
-        let Some(response) = response else {
-            continue;
+        let body = match response {
+            Some(response) => match read_limited_body(response, config.max_body_bytes).await {
+                Ok(body) => Some(body),
+                Err(problem) => {
+                    error = Some(problem.to_string());
+                    None
+                }
+            },
+            None => None,
         };
-        let Ok(body) = read_limited_body(response, config.max_body_bytes).await else {
+        special_files.push(SpecialFileRecord {
+            name: original
+                .path_segments()
+                .and_then(Iterator::last)
+                .unwrap_or("sitemap.xml")
+                .to_owned(),
+            url: original.to_string(),
+            final_url: Some(current.to_string()),
+            status_code,
+            content_type,
+            duration_ms: started.elapsed().as_millis(),
+            redirect_chain,
+            error,
+        });
+        let Some(body) = body else {
             continue;
         };
         let xml = String::from_utf8_lossy(&body);
@@ -655,7 +748,97 @@ async fn discover_sitemap_pages(start: &Url, config: &Config, limit: usize) -> V
             }
         }
     }
-    pages
+    (pages, special_files)
+}
+
+async fn probe_special_file(start: &Url, path: &str, config: &Config) -> SpecialFileRecord {
+    let original = start.join(path).unwrap_or_else(|_| start.clone());
+    let started = Instant::now();
+    let mut current = original.clone();
+    let mut status_code = None;
+    let mut content_type = None;
+    let mut redirect_chain = Vec::new();
+    let mut error = None;
+    for _ in 0..6 {
+        let addresses = match resolve_public_host(&current).await {
+            Ok(addresses) => addresses,
+            Err(message) => {
+                error = Some(message);
+                break;
+            }
+        };
+        let Some(host) = current.host_str() else {
+            error = Some("URL has no host".into());
+            break;
+        };
+        let client = match Client::builder()
+            .http1_only()
+            .redirect(Policy::none())
+            .timeout(config.request_timeout.min(Duration::from_secs(5)))
+            .user_agent(&config.user_agent)
+            .default_headers(browser_headers())
+            .resolve_to_addrs(host, &addresses)
+            .build()
+        {
+            Ok(client) => client,
+            Err(problem) => {
+                error = Some(problem.to_string());
+                break;
+            }
+        };
+        match client.get(current.clone()).send().await {
+            Ok(response) if response.status().is_redirection() => {
+                let code = response.status().as_u16();
+                let Some(location) = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                else {
+                    status_code = Some(code);
+                    error = Some("redirect response has no valid Location header".into());
+                    break;
+                };
+                let Ok(next) = current.join(location) else {
+                    status_code = Some(code);
+                    error = Some("redirect target is invalid".into());
+                    break;
+                };
+                if crawl_host(&next) != crawl_host(start)
+                    || !matches!(next.scheme(), "http" | "https")
+                {
+                    status_code = Some(code);
+                    error = Some("redirect leaves the scanned site".into());
+                    break;
+                }
+                redirect_chain.push(format!("{current} [{code}] → {next}"));
+                status_code = Some(code);
+                current = next;
+            }
+            Ok(response) => {
+                status_code = Some(response.status().as_u16());
+                content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                break;
+            }
+            Err(problem) => {
+                error = Some(problem.to_string());
+                break;
+            }
+        }
+    }
+    SpecialFileRecord {
+        name: path.trim_start_matches('/').to_owned(),
+        url: original.to_string(),
+        final_url: Some(current.to_string()),
+        status_code,
+        content_type,
+        duration_ms: started.elapsed().as_millis(),
+        redirect_chain,
+        error,
+    }
 }
 
 fn xml_loc_values(xml: &str) -> Vec<String> {
@@ -684,7 +867,9 @@ fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
 
 fn crawl_host(url: &Url) -> String {
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    host.strip_prefix("www.").unwrap_or(&host).to_owned()
+    psl::domain_str(host.strip_prefix("www.").unwrap_or(&host))
+        .unwrap_or(host.strip_prefix("www.").unwrap_or(&host))
+        .to_owned()
 }
 
 fn browser_headers() -> HeaderMap {
@@ -699,6 +884,10 @@ fn browser_headers() -> HeaderMap {
         ACCEPT_LANGUAGE,
         HeaderValue::from_static("zh-CN,zh;q=0.9,en;q=0.8"),
     );
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("gzip, deflate, br, zstd"),
+    );
     headers
 }
 
@@ -708,13 +897,7 @@ fn external_link_key(value: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-async fn check_external_link(
-    value: &str,
-    timeout: Duration,
-    user_agent: &str,
-    renderer_url: &str,
-    renderer_api_key: Option<&str>,
-) -> LinkCheck {
+async fn check_external_link(value: &str, timeout: Duration, user_agent: &str) -> LinkCheck {
     let started = Instant::now();
     let mut current = match Url::parse(value) {
         Ok(url) if matches!(url.scheme(), "http" | "https") => url,
@@ -756,6 +939,7 @@ async fn check_external_link(
             break;
         };
         let client = match Client::builder()
+            .http1_only()
             .redirect(Policy::none())
             .timeout(timeout)
             .user_agent(user_agent)
@@ -765,7 +949,7 @@ async fn check_external_link(
         {
             Ok(client) => client,
             Err(err) => {
-                failure = Some(err.to_string());
+                failure = Some(request_failure(&err));
                 break;
             }
         };
@@ -812,7 +996,7 @@ async fn check_external_link(
                 break;
             }
             Err(err) => {
-                failure = Some(err.to_string());
+                failure = Some(request_failure(&err));
                 break;
             }
         }
@@ -821,31 +1005,30 @@ async fn check_external_link(
     if failure.is_none() && final_status.is_some_and(|status| status >= 400) {
         failure = final_status.map(|status| format!("HTTP {status}"));
     }
-    let mut result = LinkCheck {
+    LinkCheck {
         status_code: final_status,
         duration_ms: started.elapsed().as_millis(),
         accessible,
         error: failure,
-    };
-    if result.accessible != Some(true)
-        && let Some(rendered) = request_renderer(renderer_url, renderer_api_key, value).await
-    {
-        result.duration_ms = started.elapsed().as_millis();
-        if rendered.accessible {
-            result.status_code = rendered.status_code;
-            result.accessible = Some(true);
-            result.error = None;
-        } else if rendered.challenge {
-            result.status_code = rendered.status_code.or(result.status_code);
-            result.accessible = Some(false);
-            result.error = Some("Browser rendering reached an access challenge".into());
-        } else if rendered.status_code.is_some() {
-            result.status_code = rendered.status_code;
-            result.accessible = Some(false);
-            result.error = rendered.error;
-        }
     }
-    result
+}
+
+fn request_failure(error: &reqwest::Error) -> String {
+    if error.is_timeout() {
+        "Request timed out".into()
+    } else if error.is_connect() {
+        let detail = error.to_string().to_ascii_lowercase();
+        if detail.contains("tls") || detail.contains("certificate") || detail.contains("handshake")
+        {
+            "TLS or certificate connection failure".into()
+        } else {
+            "Connection failed or was reset".into()
+        }
+    } else if error.is_redirect() {
+        "Redirect failed".into()
+    } else {
+        "HTTP request failed".into()
+    }
 }
 
 #[derive(Deserialize)]
@@ -855,7 +1038,6 @@ struct RendererResponse {
     accessible: bool,
     challenge: bool,
     html: Option<String>,
-    error: Option<String>,
 }
 
 async fn request_renderer(
@@ -864,7 +1046,7 @@ async fn request_renderer(
     url: &str,
 ) -> Option<RendererResponse> {
     let client = Client::builder()
-        .timeout(Duration::from_secs(25))
+        .timeout(Duration::from_secs(14))
         .build()
         .ok()?;
     let mut request = client
@@ -890,6 +1072,7 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
     let mut redirect_chain = Vec::new();
     let mut last_response = None;
     let mut ttfb_ms = None;
+    let mut initial_status_code = None;
     let mut error = None;
     for _ in 0..6 {
         let addresses = match resolve_public_host(&current).await {
@@ -904,6 +1087,7 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
             break;
         };
         let pinned_client = match Client::builder()
+            .http1_only()
             .redirect(Policy::none())
             .timeout(config.request_timeout)
             .user_agent(&config.user_agent)
@@ -920,6 +1104,8 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
         let request_started = Instant::now();
         match pinned_client.get(current.clone()).send().await {
             Ok(response) => {
+                let hop_status = response.status().as_u16();
+                initial_status_code.get_or_insert(hop_status);
                 if response.status().is_redirection() {
                     let Some(location) = response
                         .headers()
@@ -934,7 +1120,7 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
                         error = Some("invalid redirect URL".into());
                         break;
                     };
-                    redirect_chain.push(current.to_string());
+                    redirect_chain.push(format!("{} (HTTP {}) → {}", current, hop_status, next));
                     current = next;
                 } else {
                     ttfb_ms = Some(request_started.elapsed().as_millis());
@@ -950,6 +1136,9 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
     }
     let mut status_code = None;
     let mut content_type = None;
+    let mut content_encoding = None;
+    let mut cache_control = None;
+    let mut body_fingerprint = None;
     let mut title = None;
     let mut description = None;
     let mut canonical = None;
@@ -958,6 +1147,9 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
     let mut content_text = String::new();
     let mut headings = Vec::new();
     let mut response_size_bytes = None;
+    let mut raw_response_size_bytes = None;
+    let mut partial_content = false;
+    let mut html_shell_candidate = false;
     let mut links = Vec::new();
     if let Some(response) = last_response {
         status_code = Some(response.status().as_u16());
@@ -966,33 +1158,65 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        if content_type
-            .as_deref()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .contains("text/html")
-        {
-            match read_limited_body(response, config.max_body_bytes).await {
-                Ok(bytes) => {
-                    response_size_bytes = Some(bytes.len());
-                    parse_html(
-                        &current,
-                        &bytes,
-                        &mut title,
-                        &mut description,
-                        &mut canonical,
-                        &mut robots,
-                        &mut h1_count,
-                        &mut content_text,
-                        &mut headings,
-                        &mut links,
-                    );
+        content_encoding = response
+            .headers()
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        cache_control = response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        if content_type.as_deref().is_some_and(is_html_content_type) {
+            let encoding = content_encoding.clone();
+            let (raw, read_error) = read_partial_body(response, config.max_body_bytes).await;
+            raw_response_size_bytes = Some(raw.len());
+            let bytes = if read_error.is_some() {
+                decode_partial_content(&raw, encoding.as_deref(), config.max_body_bytes)
+            } else {
+                match decode_content(&raw, encoding.as_deref(), config.max_body_bytes) {
+                    Ok(bytes) => bytes,
+                    Err(message) => {
+                        error = Some(message);
+                        Vec::new()
+                    }
                 }
-                Err(message) => error = Some(message),
+            };
+            if let Some(message) = read_error {
+                error = Some(message);
+                partial_content = !bytes.is_empty();
+            }
+            if !bytes.is_empty() {
+                response_size_bytes = Some(bytes.len());
+                body_fingerprint = Some(format!("{:016x}", fingerprint(&bytes)));
+                parse_html(
+                    &current,
+                    &bytes,
+                    &mut title,
+                    &mut description,
+                    &mut canonical,
+                    &mut robots,
+                    &mut h1_count,
+                    &mut content_text,
+                    &mut headings,
+                    &mut links,
+                );
+                html_shell_candidate = looks_like_unrendered_html_shell(
+                    &bytes,
+                    title.as_deref(),
+                    &content_text,
+                    &links,
+                );
             }
         }
     }
-    if status_code.is_some_and(|status| status >= 400) || error.is_some() {
+    let should_retry_in_browser = (status_code.is_some_and(|status| status >= 400)
+        || error.is_some()
+        || html_shell_candidate
+        || content_type.is_none())
+        && should_render_html_target(&current, content_type.as_deref());
+    if should_retry_in_browser {
         if let Some(rendered) = request_renderer(
             &config.renderer_url,
             config.renderer_api_key.as_deref(),
@@ -1011,6 +1235,7 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
                     headings.clear();
                     links.clear();
                     response_size_bytes = Some(html.len());
+                    body_fingerprint = Some(format!("{:016x}", fingerprint(html.as_bytes())));
                     parse_html(
                         &rendered_url,
                         html.as_bytes(),
@@ -1026,20 +1251,23 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
                     status_code = rendered.status_code.or(Some(200));
                     content_type = Some("text/html; rendered".into());
                     error = None;
+                    partial_content = false;
+                    raw_response_size_bytes = Some(html.len());
+                    content_encoding = None;
                 }
             } else if rendered.challenge {
                 status_code = rendered.status_code.or(status_code);
-                error = None;
             } else if rendered.status_code.is_some() {
                 status_code = rendered.status_code;
-                error = None;
             }
         }
     }
     (
         PageRecord {
             url: url.to_string(),
+            final_url: current.to_string(),
             status_code,
+            initial_status_code,
             title,
             description,
             canonical,
@@ -1048,9 +1276,14 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
             content_text,
             headings,
             content_type,
+            content_encoding,
+            cache_control,
+            body_fingerprint,
             redirect_chain,
             ttfb_ms,
             response_size_bytes,
+            raw_response_size_bytes,
+            partial_content,
             links,
             depth,
             duration_ms: started.elapsed().as_millis(),
@@ -1058,6 +1291,13 @@ async fn crawl_page(url: Url, depth: usize, config: &Config) -> (PageRecord, usi
         },
         depth,
     )
+}
+
+fn fingerprint(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn parse_html(
@@ -1160,11 +1400,7 @@ fn parse_html(
             content_text.push_str(&block);
         }
     }
-    let host = final_url
-        .host_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host);
+    let host = crawl_host(final_url);
     for (position, anchor) in document.select(&anchor_selector).enumerate() {
         let Some(href) = anchor.value().attr("href") else {
             continue;
@@ -1175,8 +1411,12 @@ fn parse_html(
         if !matches!(target.scheme(), "http" | "https") {
             continue;
         }
-        let target_host = target.host_str().unwrap_or_default().to_ascii_lowercase();
-        let target_host = target_host.strip_prefix("www.").unwrap_or(&target_host);
+        // Cloudflare rewrites visible email links to its email-protection
+        // endpoint. It is an obfuscation resource, not a crawlable page.
+        if target.path().starts_with("/cdn-cgi/") {
+            continue;
+        }
+        let target_host = crawl_host(&target);
         links.push(LinkRecord {
             url: target.to_string(),
             text: html_escape::decode_html_entities(&anchor.text().collect::<String>())
@@ -1209,7 +1449,38 @@ fn crawl_key(url: &Url) -> String {
     if let Some(host) = host_without_www {
         let _ = key.set_host(Some(&host));
     }
+    let retained_query = key
+        .query_pairs()
+        .filter(|(name, _)| !is_tracking_parameter(name))
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    key.set_query(None);
+    if !retained_query.is_empty() {
+        key.query_pairs_mut().extend_pairs(retained_query);
+    }
     key.to_string()
+}
+
+fn is_tracking_parameter(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.starts_with("utm_")
+        || matches!(
+            name.as_str(),
+            "gclid"
+                | "dclid"
+                | "gbraid"
+                | "wbraid"
+                | "fbclid"
+                | "msclkid"
+                | "ttclid"
+                | "twclid"
+                | "yclid"
+                | "srsltid"
+                | "mc_cid"
+                | "mc_eid"
+                | "_ga"
+                | "_gl"
+        )
 }
 
 fn normalize_url(value: &str) -> Result<Url, String> {
@@ -1238,12 +1509,18 @@ async fn resolve_public_host(url: &Url) -> Result<Vec<SocketAddr>, String> {
         };
     }
     let port = url.port_or_known_default().ok_or("unsupported URL port")?;
-    let addresses = lookup_host((host, port))
+    let mut addresses = lookup_host((host, port))
         .await
         .map_err(|_| "host could not be resolved".to_string())?
         .collect::<Vec<_>>();
     if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
         return Err("host resolves to a private or reserved address".into());
+    }
+    // Some Linux hosts have nominal IPv6 routes that connect but stall during
+    // TLS or body transfer. Hyper may race addresses regardless of their order,
+    // so actually filter to IPv4 when available. IPv6-only hosts remain usable.
+    if addresses.iter().any(|address| address.is_ipv4()) {
+        addresses.retain(|address| address.is_ipv4());
     }
     Ok(addresses)
 }
@@ -1252,6 +1529,11 @@ async fn read_limited_body(
     mut response: reqwest::Response,
     max_bytes: usize,
 ) -> Result<Vec<u8>, String> {
+    let encoding = response
+        .headers()
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|err| err.to_string())? {
         if body.len().saturating_add(chunk.len()) > max_bytes {
@@ -1259,7 +1541,190 @@ async fn read_limited_body(
         }
         body.extend_from_slice(&chunk);
     }
-    Ok(body)
+    decode_content(&body, encoding.as_deref(), max_bytes)
+}
+
+async fn read_partial_body(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> (Vec<u8>, Option<String>) {
+    let mut body = Vec::new();
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len().saturating_add(chunk.len()) > max_bytes {
+                    return (body, Some("response body exceeds configured limit".into()));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return (body, None),
+            Err(error) => return (body, Some(request_failure(&error))),
+        }
+    }
+}
+
+fn decode_content(raw: &[u8], encoding: Option<&str>, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut decoded = raw.to_vec();
+    if let Some(encoding) = encoding {
+        for coding in encoding.split(',').map(str::trim).rev() {
+            if coding.eq_ignore_ascii_case("identity") || coding.is_empty() {
+                continue;
+            }
+            let result = match coding.to_ascii_lowercase().as_str() {
+                "gzip" | "x-gzip" => read_decoded(
+                    flate2::read::MultiGzDecoder::new(decoded.as_slice()),
+                    max_bytes,
+                ),
+                "deflate" => read_decoded(
+                    flate2::read::ZlibDecoder::new(decoded.as_slice()),
+                    max_bytes,
+                )
+                .or_else(|_| {
+                    read_decoded(
+                        flate2::read::DeflateDecoder::new(decoded.as_slice()),
+                        max_bytes,
+                    )
+                }),
+                "br" => read_decoded(
+                    brotli::Decompressor::new(decoded.as_slice(), 16 * 1024),
+                    max_bytes,
+                ),
+                "zstd" => zstd::stream::read::Decoder::new(decoded.as_slice())
+                    .and_then(|decoder| read_decoded(decoder, max_bytes)),
+                unsupported => return Err(format!("unsupported content encoding: {unsupported}")),
+            }
+            .map_err(|error| format!("could not decode {coding} response: {error}"))?;
+            if result.len() > max_bytes {
+                return Err("decoded response body exceeds configured limit".into());
+            }
+            decoded = result;
+        }
+    }
+    Ok(decoded)
+}
+
+fn read_decoded(mut reader: impl std::io::Read, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut output = Vec::new();
+    reader
+        .by_ref()
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut output)?;
+    if output.len() > max_bytes {
+        return Err(std::io::Error::other(
+            "decoded response body exceeds configured limit",
+        ));
+    }
+    Ok(output)
+}
+
+fn decode_partial_content(raw: &[u8], encoding: Option<&str>, max_bytes: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut decoded = raw.to_vec();
+    for coding in encoding.unwrap_or("").split(',').map(str::trim).rev() {
+        let reader: Box<dyn Read> = match coding.to_ascii_lowercase().as_str() {
+            "gzip" | "x-gzip" => Box::new(flate2::read::MultiGzDecoder::new(decoded.as_slice())),
+            "deflate" => Box::new(flate2::read::ZlibDecoder::new(decoded.as_slice())),
+            "br" => Box::new(brotli::Decompressor::new(decoded.as_slice(), 16 * 1024)),
+            "zstd" => match zstd::stream::read::Decoder::new(decoded.as_slice()) {
+                Ok(decoder) => Box::new(decoder),
+                Err(_) => return Vec::new(),
+            },
+            "" | "identity" => continue,
+            _ => return Vec::new(),
+        };
+        let mut output = Vec::new();
+        let _ = reader
+            .take(max_bytes.saturating_add(1) as u64)
+            .read_to_end(&mut output);
+        output.truncate(max_bytes);
+        decoded = output;
+        if decoded.is_empty() {
+            break;
+        }
+    }
+    decoded
+}
+
+fn is_html_content_type(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("text/html") || value.contains("application/xhtml+xml")
+}
+
+fn should_render_html_target(url: &Url, content_type: Option<&str>) -> bool {
+    if let Some(content_type) = content_type {
+        return is_html_content_type(content_type);
+    }
+
+    // A failed request has no response headers, so use the URL suffix only to
+    // avoid launching a page renderer for obvious static resources. Extensionless
+    // URLs are treated as possible HTML routes and may be confirmed by a browser.
+    let path = url.path();
+    let extension = path
+        .rsplit('/')
+        .next()
+        .and_then(|segment| segment.rsplit_once('.').map(|(_, ext)| ext))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !matches!(
+        extension.as_str(),
+        "css"
+            | "js"
+            | "mjs"
+            | "cjs"
+            | "json"
+            | "xml"
+            | "txt"
+            | "pdf"
+            | "svg"
+            | "png"
+            | "jpg"
+            | "jpeg"
+            | "gif"
+            | "webp"
+            | "avif"
+            | "ico"
+            | "woff"
+            | "woff2"
+            | "ttf"
+            | "otf"
+            | "eot"
+            | "mp3"
+            | "mp4"
+            | "m4a"
+            | "webm"
+            | "mov"
+            | "avi"
+            | "zip"
+            | "gz"
+            | "br"
+            | "wasm"
+            | "csv"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+    )
+}
+
+fn looks_like_unrendered_html_shell(
+    html: &[u8],
+    title: Option<&str>,
+    content_text: &str,
+    links: &[LinkRecord],
+) -> bool {
+    if content_text.chars().count() >= 120 || !links.is_empty() {
+        return false;
+    }
+    let source = String::from_utf8_lossy(html).to_ascii_lowercase();
+    let has_script = source.contains("<script");
+    let missing_title = title.is_none_or(|value| value.trim().is_empty());
+    let asks_for_javascript = source.contains("enable javascript")
+        || source.contains("javascript is required")
+        || source.contains("please enable javascript");
+    asks_for_javascript || (has_script && missing_title)
 }
 
 fn is_public_ip(ip: IpAddr) -> bool {

@@ -11,14 +11,17 @@ use chromiumoxide::{
     Browser, BrowserConfig,
     cdp::browser_protocol::{
         fetch::{ContinueRequestParams, EventRequestPaused, FailRequestParams},
-        network::ErrorReason,
+        network::{
+            EnableParams as NetworkEnableParams, ErrorReason, EventResponseReceived, ResourceType,
+        },
     },
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_os = "linux"))]
+use tokio::process::{Child, Command};
 use tokio::{
     net::{TcpListener, lookup_host},
-    process::{Child, Command},
     sync::Semaphore,
 };
 use url::Url;
@@ -29,6 +32,8 @@ struct Config {
     api_key: Option<String>,
     concurrency: usize,
     timeout: Duration,
+    obscura_port: u16,
+    obscura_binary: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -51,6 +56,8 @@ impl Config {
             timeout: Duration::from_secs(
                 env_usize("RENDERER_TIMEOUT_SECONDS", 20).clamp(5, 60) as u64
             ),
+            obscura_port: env_usize("RENDERER_OBSCURA_PORT", 19222).clamp(1024, 65535) as u16,
+            obscura_binary: std::env::var_os("OBSCURA_BIN").map(std::path::PathBuf::from),
         })
     }
 }
@@ -88,10 +95,137 @@ struct Snapshot {
     body: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    #[cfg(target_os = "linux")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--sandbox-obscura-worker")
+    {
+        return run_obscura_worker(&args);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = args;
+    #[cfg(target_os = "linux")]
+    let _private_temp = PrivateTempDir::create()?;
+    #[cfg(target_os = "linux")]
+    {
+        let path = _private_temp.0.to_string_lossy().into_owned();
+        // Set before starting Tokio so Chromium and Obscura inherit only a
+        // private scratch directory, never the service account's home.
+        unsafe {
+            std::env::set_var("HOME", &path);
+            std::env::set_var("TMPDIR", &path);
+        }
+    }
     let config = Config::from_env()?;
-    let (obscura_cdp, _obscura_process) = start_obscura().await;
+    #[cfg(target_os = "linux")]
+    let (initial_obscura_cdp, _obscura_process) =
+        spawn_obscura_worker(config.obscura_port, config.obscura_binary.clone());
+    #[cfg(target_os = "linux")]
+    clear_renderer_environment();
+    site_sandbox::apply(site_sandbox::Service::Renderer)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run(
+            config,
+            #[cfg(target_os = "linux")]
+            initial_obscura_cdp,
+        ))
+}
+
+#[cfg(target_os = "linux")]
+fn clear_renderer_environment() {
+    let retained = ["HOME", "TMPDIR", "LANG", "LC_ALL"];
+    let remove = std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| !retained.iter().any(|name| key == name))
+        .collect::<Vec<_>>();
+    unsafe {
+        for key in remove {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("PATH", "/usr/bin:/bin");
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct PrivateTempDir(std::path::PathBuf);
+
+#[cfg(target_os = "linux")]
+struct ObscuraProcess(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for ObscuraProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PrivateTempDir {
+    fn create() -> Result<Self, std::io::Error> {
+        use std::{os::unix::fs::PermissionsExt, time::SystemTime};
+
+        let parent = std::path::PathBuf::from("/tmp");
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for attempt in 0..100 {
+            let path = parent.join(format!(
+                "seeyourseo-renderer-{}-{nonce}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&path) {
+                Ok(()) => {
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+                    return Ok(Self(path));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a private renderer temporary directory",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PrivateTempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_obscura_worker(args: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    let expected_parent: i32 = args
+        .get(1)
+        .ok_or("missing renderer parent process id")?
+        .to_string_lossy()
+        .parse()?;
+    site_sandbox::set_parent_death_signal(expected_parent)?;
+    let binary = args
+        .get(2)
+        .map(std::path::PathBuf::from)
+        .ok_or("missing Obscura executable path")?;
+    Err(site_sandbox::exec_obscura(&binary, &args[3..]).into())
+}
+
+async fn run(
+    config: Config,
+    #[cfg(target_os = "linux")] initial_obscura_cdp: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    let obscura_cdp = wait_for_obscura(initial_obscura_cdp).await;
+    #[cfg(not(target_os = "linux"))]
+    let (obscura_cdp, _obscura_process) =
+        start_obscura(config.obscura_port, config.obscura_binary.clone()).await;
     if obscura_cdp.is_some() {
         eprintln!("using Obscura as the primary rendering engine");
     } else {
@@ -113,6 +247,75 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("site renderer listening on {}", config.listen);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_obscura_worker(
+    port: u16,
+    configured_binary: Option<std::path::PathBuf>,
+) -> (Option<String>, Option<ObscuraProcess>) {
+    let cdp_url = format!("http://127.0.0.1:{port}");
+    let binary = configured_binary.or_else(|| {
+        let parent = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let candidate = parent.join("sandbox/obscura/obscura");
+        candidate.is_file().then_some(candidate)
+    });
+    let Some(binary) = binary.filter(|path| path.is_file()) else {
+        return (None, None);
+    };
+    let binary = match std::fs::canonicalize(binary) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("could not resolve Obscura executable path: {error}");
+            return (None, None);
+        }
+    };
+    let worker = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("could not locate renderer executable for Obscura worker: {error}");
+            return (None, None);
+        }
+    };
+    let temp_dir = std::env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into());
+    let child = match std::process::Command::new(worker)
+        .arg("--sandbox-obscura-worker")
+        .arg(std::process::id().to_string())
+        .arg(&binary)
+        .arg("serve")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(port.to_string())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &temp_dir)
+        .env("TMPDIR", temp_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!("could not start Obscura sandbox worker: {error}");
+            return (None, None);
+        }
+    };
+    (Some(cdp_url), Some(ObscuraProcess(child)))
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_obscura(cdp_url: Option<String>) -> Option<String> {
+    let cdp_url = cdp_url?;
+    for _ in 0..40 {
+        if Browser::connect(cdp_url.clone()).await.is_ok() {
+            return Some(cdp_url);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    eprintln!("sandboxed Obscura did not become ready; rendering will report unavailable");
+    None
 }
 
 async fn render(
@@ -148,11 +351,19 @@ async fn render(
             match render_page(url.clone(), Some(endpoint)).await {
                 Ok(snapshot) => Ok(snapshot),
                 Err(error) => {
-                    eprintln!("Obscura render failed; trying Chrome/Chromium: {error}");
-                    render_page(url, None).await
+                    #[cfg(target_os = "linux")]
+                    return Err(error);
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        eprintln!("Obscura render failed; trying Chrome/Chromium: {error}");
+                        render_page(url, None).await
+                    }
                 }
             }
         } else {
+            #[cfg(target_os = "linux")]
+            return Err("sandboxed Obscura worker is unavailable".into());
+            #[cfg(not(target_os = "linux"))]
             render_page(url, None).await
         }
     })
@@ -190,21 +401,32 @@ async fn render(
     }
 }
 
-async fn start_obscura() -> (Option<String>, Option<Child>) {
-    let port = env_usize("RENDERER_OBSCURA_PORT", 19222).clamp(1024, 65535);
+#[cfg(not(target_os = "linux"))]
+async fn start_obscura(
+    port: u16,
+    configured_binary: Option<std::path::PathBuf>,
+) -> (Option<String>, Option<Child>) {
     let cdp_url = format!("http://127.0.0.1:{port}");
-    let binary = std::env::var_os("OBSCURA_BIN")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()?
-                .parent()
-                .map(|parent| parent.join("obscura"))
-        });
+    let binary = configured_binary.or_else(|| {
+        let parent = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        if cfg!(target_os = "linux") {
+            Some(parent.join("sandbox/obscura/obscura"))
+        } else {
+            Some(parent.join("obscura"))
+        }
+    });
     let Some(binary) = binary.filter(|path| path.is_file()) else {
         return (None, None);
     };
-    let child = match Command::new(binary)
+    let binary = match std::fs::canonicalize(&binary) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("could not resolve Obscura executable path: {error}");
+            return (None, None);
+        }
+    };
+    let mut command = Command::new(binary);
+    let child = match command
         .arg("serve")
         .arg("--host")
         .arg("127.0.0.1")
@@ -233,17 +455,22 @@ async fn start_obscura() -> (Option<String>, Option<Child>) {
 }
 
 async fn render_page(url: Url, obscura_cdp: Option<&str>) -> Result<Snapshot, String> {
-    let config = BrowserConfig::builder()
-        .new_headless_mode()
-        .window_size(1365, 768)
-        .arg("--lang=zh-CN")
-        .arg("--force-color-profile=srgb")
-        .enable_request_intercept()
-        .build()
-        .map_err(|e| e.to_string())?;
+    use std::sync::atomic::{AtomicU16, Ordering};
+
     let (mut browser, mut handler) = if let Some(endpoint) = obscura_cdp {
-        Browser::connect(endpoint.to_owned()).await.map_err(|e| e.to_string())?
+        Browser::connect(endpoint.to_owned())
+            .await
+            .map_err(|e| format!("connect to Obscura CDP: {e}"))?
     } else {
+        let config = BrowserConfig::builder()
+            .new_headless_mode()
+            .window_size(1365, 768)
+            .arg("--lang=zh-CN")
+            .arg("--force-color-profile=srgb")
+            .arg("--disable-dev-shm-usage")
+            .enable_request_intercept()
+            .build()
+            .map_err(|e| e.to_string())?;
         Browser::launch(config).await.map_err(|e| e.to_string())?
     };
     let remote = obscura_cdp.is_some();
@@ -257,11 +484,29 @@ async fn render_page(url: Url, obscura_cdp: Option<&str>) -> Result<Snapshot, St
     let page = browser
         .new_page("about:blank")
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("create browser page: {e}"))?;
+    page.execute(NetworkEnableParams::default())
+        .await
+        .map_err(|e| format!("enable browser network events: {e}"))?;
+    let mut responses = page
+        .event_listener::<EventResponseReceived>()
+        .await
+        .map_err(|e| format!("listen for browser responses: {e}"))?;
+    let response_status = Arc::new(AtomicU16::new(0));
+    let observed_status = response_status.clone();
+    let response_task = tokio::spawn(async move {
+        while let Some(event) = responses.next().await {
+            if event.r#type == ResourceType::Document
+                && (100..=599).contains(&event.response.status)
+            {
+                observed_status.store(event.response.status as u16, Ordering::Relaxed);
+            }
+        }
+    });
     let mut requests = page
         .event_listener::<EventRequestPaused>()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("enable request interception: {e}"))?;
     let intercept_page = page.clone();
     let intercept_task = tokio::spawn(async move {
         while let Some(event) = requests.next().await {
@@ -288,12 +533,14 @@ async fn render_page(url: Url, obscura_cdp: Option<&str>) -> Result<Snapshot, St
             }
         }
     });
-    page.goto(url.as_str()).await.map_err(|e| e.to_string())?;
+    page.goto(url.as_str())
+        .await
+        .map_err(|e| format!("navigate with browser: {e}"))?;
     // Give hydration and deferred scripts time to update the DOM, as a normal
     // desktop tab would after its load event.
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let challenge_deadline = tokio::time::Instant::now() + Duration::from_secs(8);
-    let snapshot = loop {
+    let mut snapshot = loop {
         let json = page.evaluate_expression("JSON.stringify({url: location.href, status: performance.getEntriesByType('navigation')[0]?.responseStatus || 0, title: document.title || '', html: document.documentElement?.outerHTML || '', body: document.body?.innerText || ''})")
             .await.map_err(|e| e.to_string())?.into_value::<String>().map_err(|e| e.to_string())?;
         let snapshot: Snapshot = serde_json::from_str(&json).map_err(|e| e.to_string())?;
@@ -304,6 +551,9 @@ async fn render_page(url: Url, obscura_cdp: Option<&str>) -> Result<Snapshot, St
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
+    if snapshot.status == 0 {
+        snapshot.status = response_status.load(Ordering::Relaxed);
+    }
     if remote {
         let _ = page.close().await;
     } else {
@@ -311,6 +561,7 @@ async fn render_page(url: Url, obscura_cdp: Option<&str>) -> Result<Snapshot, St
     }
     handler_task.abort();
     intercept_task.abort();
+    response_task.abort();
     Ok(snapshot)
 }
 

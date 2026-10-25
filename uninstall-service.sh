@@ -12,7 +12,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     DOMAIN="gui/$(id -u)"
     SERVICE_DIR="$HOME/Library/LaunchAgents"
     for label in local.sitesissues.crawler local.sitesissues.analyzer local.sitesissues.renderer local.sitesissues.site-audit-server; do
-      if rtk proxy launchctl print "system/$label" >/dev/null 2>&1; then
+      if launchctl print "system/$label" >/dev/null 2>&1; then
         echo "System LaunchDaemon $label requires elevated privileges. Run 'sudo ./uninstall-service.sh' in Terminal." >&2
         exit 2
       fi
@@ -21,12 +21,12 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
 
   for label in local.sitesissues.site-audit-server local.sitesissues.analyzer local.sitesissues.renderer local.sitesissues.crawler; do
     PLIST="$SERVICE_DIR/$label.plist"
-    if rtk proxy launchctl print "$DOMAIN/$label" >/dev/null 2>&1; then
-      rtk proxy launchctl bootout "$DOMAIN" "$PLIST"
+    if launchctl print "$DOMAIN/$label" >/dev/null 2>&1; then
+      launchctl bootout "$DOMAIN" "$PLIST"
       echo "Stopped $label"
     fi
     if [[ -e "$PLIST" ]]; then
-      rtk rm -f "$PLIST"
+      rm -f "$PLIST"
       echo "Removed $PLIST"
     fi
   done
@@ -38,4 +38,8 @@ if [[ ! -x "$BACKEND" ]]; then
   exit 1
 fi
 
-rtk proxy "$BACKEND" uninstall-services "$@"
+if [[ "$(uname -s)" == "Linux" && " ${*:-} " != *" --user "* ]]; then
+  set -- --user "$@"
+fi
+
+"$BACKEND" uninstall-services "$@"

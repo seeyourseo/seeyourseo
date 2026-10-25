@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /checkout
+Disallow: /account
+Disallow: /login
+
+Sitemap: https://seeyourseo.com/sitemap.xml

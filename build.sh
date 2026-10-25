@@ -7,30 +7,39 @@ BIN_DIR="$BUILD_DIR/bin"
 
 export CARGO_TARGET_DIR="$BUILD_DIR/cargo-target"
 
-rtk mkdir -p "$BIN_DIR"
+mkdir -p "$BIN_DIR"
 
-rtk cargo build --release --locked --manifest-path "$ROOT/services/site-crawler/Cargo.toml"
-rtk cargo build --release --locked --manifest-path "$ROOT/services/site-analyzer/Cargo.toml"
-rtk cargo build --release --locked --manifest-path "$ROOT/services/site-renderer/Cargo.toml"
-rtk cargo build --release --locked --manifest-path "$ROOT/backend/Cargo.toml"
+replace_binary() {
+  local source="$1"
+  local destination="$2"
+  local temporary="${destination}.new.$$"
+  cp "$source" "$temporary"
+  chmod 755 "$temporary"
+  mv -f "$temporary" "$destination"
+}
+
+cargo build --release --locked --manifest-path "$ROOT/services/site-crawler/Cargo.toml"
+cargo build --release --locked --manifest-path "$ROOT/services/site-analyzer/Cargo.toml"
+cargo build --release --locked --manifest-path "$ROOT/services/site-renderer/Cargo.toml"
+cargo build --release --locked --manifest-path "$ROOT/backend/Cargo.toml"
 
 # Build Obscura from a pinned upstream source tag. Its default render feature
 # includes the native browser engine without the optional stealth transport.
 OBSCURA_SOURCE="$ROOT/third_party/obscura"
-if [[ ! -d "$OBSCURA_SOURCE/.git" ]]; then
-  rtk mkdir -p "$(dirname "$OBSCURA_SOURCE")"
-  rtk git clone --depth 1 --branch v0.2.5 https://github.com/h4ckf0r0day/obscura.git "$OBSCURA_SOURCE"
+if [[ ! -f "$OBSCURA_SOURCE/Cargo.toml" ]]; then
+  mkdir -p "$(dirname "$OBSCURA_SOURCE")"
+  git clone --depth 1 --branch v0.2.5 https://github.com/h4ckf0r0day/obscura.git "$OBSCURA_SOURCE"
 fi
-rtk cargo build --release --locked --manifest-path "$OBSCURA_SOURCE/Cargo.toml" \
+cargo build --release --locked --manifest-path "$OBSCURA_SOURCE/Cargo.toml" \
   -p obscura-cli --bins --features render
 
-rtk cp "$CARGO_TARGET_DIR/release/site-crawler" "$BIN_DIR/site-crawler"
-rtk cp "$CARGO_TARGET_DIR/release/site-analyzer" "$BIN_DIR/site-analyzer"
-rtk cp "$CARGO_TARGET_DIR/release/site-renderer" "$BIN_DIR/site-renderer"
-rtk cp "$CARGO_TARGET_DIR/release/site-audit-server" "$BIN_DIR/site-audit-server"
-rtk cp "$CARGO_TARGET_DIR/release/obscura" "$BIN_DIR/obscura"
+replace_binary "$CARGO_TARGET_DIR/release/site-crawler" "$BIN_DIR/site-crawler"
+replace_binary "$CARGO_TARGET_DIR/release/site-analyzer" "$BIN_DIR/site-analyzer"
+replace_binary "$CARGO_TARGET_DIR/release/site-renderer" "$BIN_DIR/site-renderer"
+replace_binary "$CARGO_TARGET_DIR/release/site-audit-server" "$BIN_DIR/site-audit-server"
+replace_binary "$CARGO_TARGET_DIR/release/obscura" "$BIN_DIR/obscura"
 if [[ -f "$CARGO_TARGET_DIR/release/obscura-worker" ]]; then
-  rtk cp "$CARGO_TARGET_DIR/release/obscura-worker" "$BIN_DIR/obscura-worker"
+    replace_binary "$CARGO_TARGET_DIR/release/obscura-worker" "$BIN_DIR/obscura-worker"
 fi
 
 # Rust's macOS linker emits an ad-hoc signature. AMFI may kill such binaries
@@ -44,8 +53,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     while IFS= read -r identity; do
       SIGNING_IDENTITIES+=("$identity")
     done < <(
-      rtk security find-identity -v -p codesigning |
-        rtk awk '/valid identities found/ { exit } /^[[:space:]]*[0-9]+\)/ { print $2 }'
+      security find-identity -v -p codesigning |
+        awk '/valid identities found/ { exit } /^[[:space:]]*[0-9]+\)/ { print $2 }'
     )
   fi
   if [[ "${#SIGNING_IDENTITIES[@]}" -eq 0 ]]; then
@@ -57,8 +66,8 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     [[ -f "$BIN_DIR/$binary" ]] || continue
     SIGNED=false
     for identity in "${SIGNING_IDENTITIES[@]}"; do
-      if rtk codesign --force --sign "$identity" --timestamp=none "$BIN_DIR/$binary" &&
-        rtk codesign --verify --strict "$BIN_DIR/$binary" >/dev/null 2>&1; then
+      if codesign --force --sign "$identity" --timestamp=none "$BIN_DIR/$binary" &&
+        codesign --verify --strict "$BIN_DIR/$binary" >/dev/null 2>&1; then
         SIGNED=true
         break
       fi
@@ -70,6 +79,13 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   done
 fi
 
-rtk rm -f "$BIN_DIR/openseo-site-crawler" "$BIN_DIR/openseo-site-analyzer" "$BIN_DIR/openseo-web" "$BIN_DIR/backend"
+# Linux keeps the sandbox launchers in dedicated directories. The renderer
+# can execute these workers without gaining execute access to sibling services.
+if [[ "$(uname -s)" == "Linux" ]]; then
+  mkdir -p "$BIN_DIR/sandbox/obscura"
+  ln -f "$BIN_DIR/obscura" "$BIN_DIR/sandbox/obscura/obscura"
+fi
+
+rm -f "$BIN_DIR/openseo-site-crawler" "$BIN_DIR/openseo-site-analyzer" "$BIN_DIR/openseo-web" "$BIN_DIR/backend"
 
 printf 'Build complete. Binaries: %s\n' "$BIN_DIR"
