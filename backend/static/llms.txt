@@ -1,0 +1,30 @@
+# SeeYourSEO
+
+> SeeYourSEO is a website audit tool that helps site owners understand crawl coverage, broken links, page speed, content themes, and site structure.
+
+The site offers free full-site scans with no fixed free-tier page cap. Actual coverage depends on site structure and available service capacity. Reports are temporary and focus on the scanned domain. Findings describe what the scanner observed and should be checked against the live page before making changes.
+
+## Product
+
+- [Website SEO audit](https://seeyourseo.com/): Overview of SeeYourSEO and its reports.
+- [Start a scan](https://seeyourseo.com/scan): Scan a website and review its pages, links, performance, and content.
+- [Blog and guides](https://seeyourseo.com/blog): Practical articles about SEO research, site launches, and technical SEO.
+
+## Guides
+
+- [SEO research and launch workflow](https://seeyourseo.com/blog/seo-research-workflow): Research demand and plan an SEO-led launch.
+- [Open-source SEO toolkit](https://seeyourseo.com/blog/open-source-seo-toolkit): Open-source projects for SEO audits and workflows.
+- [Google SEO step by step](https://seeyourseo.com/blog/google-seo-step-by-step): Beginner guide to creating and improving search-friendly pages.
+- [Google Preferred Sources](https://seeyourseo.com/blog/google-preferred-sources): Guidance for news publishers using Preferred Sources.
+- [Keyword research](https://seeyourseo.com/blog/keyword-research): Find search topics and organize a content plan.
+- [Website launch checkup](https://seeyourseo.com/blog/website-launch-checkup): Checks to run before and after a site launch.
+- [On-page SEO](https://seeyourseo.com/blog/on-page-seo): Improve titles, headings, content, and internal links.
+- [Growth and distribution](https://seeyourseo.com/blog/growth-distribution): Promote useful content and measure growth.
+- [Technical SEO checklist](https://seeyourseo.com/blog/technical-seo): Review crawling, indexing, HTTPS, and site structure.
+- [SEO tools directory](https://seeyourseo.com/blog/tools): Tools for research, measurement, and SEO work.
+
+## Policies
+
+- [Privacy policy](https://seeyourseo.com/privacy): How the service handles information and scan reports.
+- [Terms of service](https://seeyourseo.com/terms): Terms for using SeeYourSEO.
+- [XML sitemap](https://seeyourseo.com/sitemap.xml): Indexable pages on this site.
