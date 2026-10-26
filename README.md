@@ -3,11 +3,11 @@
 **A practical website SEO audit for pages, links, content patterns, and technical issues.**
 
 <p>
-  <a href="https://seeyourseo.com/">Try SeeYourSEO online</a> ·
+  <a href="https://seeyourseo.com/">Free website SEO audit tool</a> ·
   <a href="https://seeyourseo.com/pricing">See paid scan plans</a>
 </p>
 
-Start with a free scan of up to 20 pages. When you need a deeper crawl, paid one-time plans cover up to 2,000 pages, with no subscription or automatic renewal. See the website for current plans and pricing.
+Free scans have no fixed per-scan page cap; coverage depends on your site's structure and the service's configured capacity. When you need a deeper crawl, paid one-time plans cover up to 2,000 pages, with no subscription or automatic renewal. See the website for current plans and pricing.
 
 ## What it does
 
