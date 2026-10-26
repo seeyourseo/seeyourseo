@@ -55,6 +55,7 @@ These reviews examine public source code and documentation; they are not perform
 
 - [OpenSEO review](https://seeyourseo.com/blog/open-seo-review)
 - [Claude SEO review](https://seeyourseo.com/blog/claude-seo-review)
+- [Jev SEO review](https://seeyourseo.com/blog/jev-seo-review)
 
 ## License
 

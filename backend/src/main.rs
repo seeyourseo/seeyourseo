@@ -1080,6 +1080,7 @@ async fn blog_article(Path(slug): Path<String>) -> axum::response::Response {
         "open-seo-review" => include_str!("../static/blog-articles/open-seo-review.html"),
         "claude-seo-review" => include_str!("../static/blog-articles/claude-seo-review.html"),
         "chatgpt-seo-review" => include_str!("../static/blog-articles/chatgpt-seo-review.html"),
+        "jev-seo-review" => include_str!("../static/blog-articles/jev-seo-review.html"),
         _ => return Redirect::to("/blog").into_response(),
     };
     Html(page).into_response()
