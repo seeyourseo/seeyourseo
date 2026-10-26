@@ -3,7 +3,7 @@
 **A practical website SEO audit for pages, links, content patterns, and technical issues.**
 
 <p>
-  <a href="https://seeyourseo.com/">Free website SEO audit tool</a> ·
+  <a href="https://seeyourseo.com/">Open source SEO audit tool</a> ·
   <a href="https://seeyourseo.com/pricing">See paid scan plans</a>
 </p>
 
@@ -51,4 +51,4 @@ Run a free scan at [seeyourseo.com](https://seeyourseo.com/). For larger sites, 
 
 ## License
 
-This repository does not currently include a root-level license. Third-party components may have separate licenses; check their directories before reuse.
+This repository is licensed under the [MIT License](LICENSE). Third-party components may have separate licenses; check their directories before reuse.
