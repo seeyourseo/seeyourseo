@@ -49,6 +49,13 @@ For service installation, runtime configuration, and deployment details, see [`b
 
 Run a free scan at [seeyourseo.com](https://seeyourseo.com/). For larger sites, [view the paid plans](https://seeyourseo.com/pricing): each purchase adds one scan credit, with page limits from 100 to 2,000 pages. Checkout is a one-time payment with no recurring subscription.
 
+## Code reviews of other SEO projects
+
+These reviews examine public source code and documentation; they are not performance benchmarks. SeeYourSEO is our product, and each article discloses that relationship.
+
+- [OpenSEO review](https://seeyourseo.com/blog/open-seo-review)
+- [Claude SEO review](https://seeyourseo.com/blog/claude-seo-review)
+
 ## License
 
 This repository is licensed under the [MIT License](LICENSE). Third-party components may have separate licenses; check their directories before reuse.
