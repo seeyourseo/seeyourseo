@@ -367,6 +367,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .route("/sitemap.xml", get(sitemap))
         .route("/llms.txt", get(llms_text))
         .route("/robots.txt", get(robots_txt))
+        .route("/ads.txt", get(ads_txt))
         .route("/admin", get(admin_page))
         .route("/scan", get(scan_page))
         .route("/pricing", get(pricing_page))
@@ -631,6 +632,16 @@ async fn robots_txt() -> impl IntoResponse {
             (header::CACHE_CONTROL, "public, max-age=3600"),
         ],
         include_str!("../static/robots.txt"),
+    )
+}
+
+async fn ads_txt() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=3600"),
+        ],
+        include_str!("../static/ads.txt"),
     )
 }
 
